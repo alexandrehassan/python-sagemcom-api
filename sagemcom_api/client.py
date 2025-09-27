@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 import hashlib
 import json
 import math
@@ -15,6 +15,7 @@ import urllib.parse
 from aiohttp import (
     ClientConnectorError,
     ClientOSError,
+    ClientResponse,
     ClientSession,
     ClientTimeout,
     ServerDisconnectedError,
@@ -23,23 +24,8 @@ from aiohttp import (
 import backoff
 import humps
 
-from .const import (
-    API_ENDPOINT,
-    DEFAULT_TIMEOUT,
-    DEFAULT_USER_AGENT,
-    UINT_MAX,
-    XMO_ACCESS_RESTRICTION_ERR,
-    XMO_AUTHENTICATION_ERR,
-    XMO_INVALID_SESSION_ERR,
-    XMO_LOGIN_RETRY_ERR,
-    XMO_MAX_SESSION_COUNT_ERR,
-    XMO_NO_ERR,
-    XMO_NON_WRITABLE_PARAMETER_ERR,
-    XMO_REQUEST_ACTION_ERR,
-    XMO_REQUEST_NO_ERR,
-    XMO_UNKNOWN_PATH_ERR,
-)
-from .enums import EncryptionMethod
+from .const import API_ENDPOINT, DEFAULT_TIMEOUT, DEFAULT_USER_AGENT, UINT_MAX
+from .enums import EncryptionMethod, ErrorCodes
 from .exceptions import (
     AccessRestrictionException,
     AuthenticationException,
@@ -49,6 +35,7 @@ from .exceptions import (
     LoginTimeoutException,
     MaximumSessionCountException,
     NonWritableParameterException,
+    RetryableException,
     UnauthorizedException,
     UnknownException,
     UnknownPathException,
@@ -60,6 +47,40 @@ from .models import Device, DeviceInfo, PortMapping
 async def retry_login(invocation: Mapping[str, Any]) -> None:
     """Retry login via backoff if an exception occurs."""
     await invocation["args"][0].login()
+
+
+def _handle_error(error: dict, actions: Iterable) -> None:
+    # Error in one of the actions
+    if error["description"] != ErrorCodes.XMO_REQUEST_ACTION_ERR:
+        return
+    # pylint:disable=fixme
+    # TODO How to support multiple actions + error handling?
+    for action in actions:
+        action_error = action["error"]
+        action_error_desc = action_error["description"]
+        match action_error_desc:
+            case ErrorCodes.XMO_NO_ERR:
+                continue
+            case ErrorCodes.XMO_AUTHENTICATION_ERR:
+                raise AuthenticationException(action_error)
+            case ErrorCodes.XMO_ACCESS_RESTRICTION_ERR:
+                raise AccessRestrictionException(action_error)
+            case ErrorCodes.XMO_NON_WRITABLE_PARAMETER_ERR:
+                raise NonWritableParameterException(action_error)
+            case ErrorCodes.XMO_UNKNOWN_PATH_ERR:
+                raise UnknownPathException(action_error)
+            case ErrorCodes.XMO_MAX_SESSION_COUNT_ERR:
+                raise MaximumSessionCountException(action_error)
+            case ErrorCodes.XMO_LOGIN_RETRY_ERR:
+                raise LoginRetryErrorException(action_error)
+            case _:
+                raise UnknownException(action_error)
+
+
+# def _retry_login(func):
+#     backoff.on_exception(
+#         backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
+#     )(func)
 
 
 # pylint: disable=too-many-instance-attributes
@@ -77,7 +98,7 @@ class SagemcomClient:
         authentication_method: EncryptionMethod | None = None,
         session: ClientSession | None = None,
         ssl: bool | None = False,
-        verify_ssl: bool | None = True,
+        verify_ssl: bool = True,
     ):
         """
         Create a SagemCom client.
@@ -99,6 +120,7 @@ class SagemcomClient:
         self._server_nonce = ""
         self._session_id = 0
         self._request_id = -1
+        self.api_host = f"{self.protocol}://{self.host}{API_ENDPOINT}"
 
         self.session = (
             session
@@ -106,9 +128,7 @@ class SagemcomClient:
             else ClientSession(
                 headers={"User-Agent": f"{DEFAULT_USER_AGENT}"},
                 timeout=ClientTimeout(DEFAULT_TIMEOUT),
-                connector=TCPConnector(
-                    verify_ssl=verify_ssl if verify_ssl is not None else True
-                ),
+                connector=TCPConnector(verify_ssl=verify_ssl),
             )
         )
 
@@ -183,7 +203,7 @@ class SagemcomClient:
         auth_string = f"{credential_hash}:{self._request_id}:{self._current_nonce}:JSON:{API_ENDPOINT}"
         self._auth_key = self.__generate_hash(auth_string)
 
-    def __get_response_error(self, response):
+    def __get_response_error(self, response: ClientResponse) -> dict | None:
         """Retrieve response error from result."""
         try:
             value = response["reply"]["error"]
@@ -221,8 +241,8 @@ class SagemcomClient:
         max_tries=5,
     )
     # pylint: disable=too-many-branches
-    async def __post(self, url, data):
-        async with self.session.post(url, data=data) as response:
+    async def __post(self, data) -> dict:
+        async with self.session.post(self.api_host, data=data) as response:
             if response.status == 400:
                 result = await response.text()
                 raise BadRequestException(result)
@@ -239,49 +259,19 @@ class SagemcomClient:
             error = self.__get_response_error(result)
 
             # No errors
-            if (
-                error["description"] == XMO_REQUEST_NO_ERR
-                or error["description"] == "Ok"  # NOQA: W503
+            if error is None or error["description"] in (
+                ErrorCodes.XMO_REQUEST_NO_ERR,
+                "Ok",
             ):
                 return result
 
-            if error["description"] == XMO_INVALID_SESSION_ERR:
+            if error["description"] == ErrorCodes.XMO_INVALID_SESSION_ERR:
                 self._session_id = 0
                 self._server_nonce = ""
                 self._request_id = -1
                 raise InvalidSessionException(error)
 
-            # Error in one of the actions
-            if error["description"] == XMO_REQUEST_ACTION_ERR:
-                # pylint:disable=fixme
-                # TODO How to support multiple actions + error handling?
-                actions = result["reply"]["actions"]
-                for action in actions:
-                    action_error = action["error"]
-                    action_error_desc = action_error["description"]
-
-                    if action_error_desc == XMO_NO_ERR:
-                        continue
-
-                    if action_error_desc == XMO_AUTHENTICATION_ERR:
-                        raise AuthenticationException(action_error)
-
-                    if action_error_desc == XMO_ACCESS_RESTRICTION_ERR:
-                        raise AccessRestrictionException(action_error)
-
-                    if action_error_desc == XMO_NON_WRITABLE_PARAMETER_ERR:
-                        raise NonWritableParameterException(action_error)
-
-                    if action_error_desc == XMO_UNKNOWN_PATH_ERR:
-                        raise UnknownPathException(action_error)
-
-                    if action_error_desc == XMO_MAX_SESSION_COUNT_ERR:
-                        raise MaximumSessionCountException(action_error)
-
-                    if action_error_desc == XMO_LOGIN_RETRY_ERR:
-                        raise LoginRetryErrorException(action_error)
-
-                    raise UnknownException(action_error)
+            _handle_error(error, result["reply"]["actions"])
 
             return result
 
@@ -290,8 +280,6 @@ class SagemcomClient:
         self.__generate_request_id()
         self.__generate_nonce()
         self.__generate_auth_key()
-
-        api_host = f"{self.protocol}://{self.host}{API_ENDPOINT}"
 
         payload = {
             "request": {
@@ -306,14 +294,9 @@ class SagemcomClient:
 
         form_data = {"req": json.dumps(payload, separators=(",", ":"))}
         try:
-            result = await self.__post(api_host, form_data)
-            return result
-        except (
-            ClientConnectorError,
-            ClientOSError,
-            ServerDisconnectedError,
-        ) as exception:
-            raise ConnectionError(str(exception)) from exception
+            return await self.__post(form_data)
+        except (ClientConnectorError, ClientOSError, ServerDisconnectedError) as e:
+            raise ConnectionError(str(e)) from e
 
     async def login(self):
         """Login to the SagemCom F@st router using a username and password."""
@@ -345,9 +328,7 @@ class SagemcomClient:
         try:
             response = await self.__api_request_async([actions], True)
         except asyncio.TimeoutError as exception:
-            raise LoginTimeoutException(
-                "Login request timed-out. This could be caused by using the wrong encryption method, or using a (non) SSL connection."
-            ) from exception
+            raise LoginTimeoutException from exception
 
         data = self.__get_response(response)
 
@@ -394,15 +375,7 @@ class SagemcomClient:
         return None
 
     @backoff.on_exception(
-        backoff.expo,
-        (
-            AuthenticationException,
-            LoginRetryErrorException,
-            LoginTimeoutException,
-            InvalidSessionException,
-        ),
-        max_tries=1,
-        on_backoff=retry_login,
+        backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
     )
     async def get_value_by_xpath(self, xpath: str, options: dict | None = None) -> dict:
         """
@@ -424,15 +397,7 @@ class SagemcomClient:
         return data
 
     @backoff.on_exception(
-        backoff.expo,
-        (
-            AuthenticationException,
-            LoginRetryErrorException,
-            LoginTimeoutException,
-            InvalidSessionException,
-        ),
-        max_tries=1,
-        on_backoff=retry_login,
+        backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
     )
     async def get_values_by_xpaths(self, xpaths, options: dict | None = None) -> dict:
         """
@@ -458,15 +423,7 @@ class SagemcomClient:
         return data
 
     @backoff.on_exception(
-        backoff.expo,
-        (
-            AuthenticationException,
-            LoginRetryErrorException,
-            LoginTimeoutException,
-            InvalidSessionException,
-        ),
-        max_tries=1,
-        on_backoff=retry_login,
+        backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
     )
     async def set_value_by_xpath(
         self, xpath: str, value: str, options: dict | None = None
@@ -491,15 +448,7 @@ class SagemcomClient:
         return response
 
     @backoff.on_exception(
-        backoff.expo,
-        (
-            AuthenticationException,
-            LoginRetryErrorException,
-            LoginTimeoutException,
-            InvalidSessionException,
-        ),
-        max_tries=1,
-        on_backoff=retry_login,
+        backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
     )
     async def get_device_info(self) -> DeviceInfo:
         """Retrieve information about Sagemcom F@st device."""
@@ -522,15 +471,7 @@ class SagemcomClient:
         return DeviceInfo(**data)
 
     @backoff.on_exception(
-        backoff.expo,
-        (
-            AuthenticationException,
-            LoginRetryErrorException,
-            LoginTimeoutException,
-            InvalidSessionException,
-        ),
-        max_tries=1,
-        on_backoff=retry_login,
+        backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
     )
     async def get_hosts(self, only_active: bool | None = False) -> list[Device]:
         """Retrieve hosts connected to Sagemcom F@st device."""
@@ -546,15 +487,7 @@ class SagemcomClient:
         return devices
 
     @backoff.on_exception(
-        backoff.expo,
-        (
-            AuthenticationException,
-            LoginRetryErrorException,
-            LoginTimeoutException,
-            InvalidSessionException,
-        ),
-        max_tries=1,
-        on_backoff=retry_login,
+        backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
     )
     async def get_port_mappings(self) -> list[PortMapping]:
         """Retrieve configured Port Mappings on Sagemcom F@st device."""
@@ -564,15 +497,7 @@ class SagemcomClient:
         return port_mappings
 
     @backoff.on_exception(
-        backoff.expo,
-        (
-            AuthenticationException,
-            LoginRetryErrorException,
-            LoginTimeoutException,
-            InvalidSessionException,
-        ),
-        max_tries=1,
-        on_backoff=retry_login,
+        backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
     )
     async def reboot(self):
         """Reboot Sagemcom F@st device."""
