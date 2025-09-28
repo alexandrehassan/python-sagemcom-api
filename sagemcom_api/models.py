@@ -1,7 +1,7 @@
 """Models for the Sagemcom F@st client."""
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, List, Optional
 
 
@@ -164,3 +164,59 @@ class PortMapping:
     def id(self):
         """Return unique ID for port mapping."""
         return self.uid
+
+
+@dataclass
+class Action:
+    """Represents an action to be sent to the Sagemcom API."""
+
+    id: int
+    method: str
+    xpath: str = field(default="")
+    parameters: dict[str, Any] = field(default_factory=dict)
+    options: dict = field(default_factory=dict)
+
+    def action_dict(self) -> dict:
+        """Return action as dict"""
+        return {k: v for k, v in asdict(self).items() if v}
+
+
+def LoginAction(username: str) -> Action:
+    return Action(
+        0,
+        method="logIn",
+        parameters={
+            "user": username,
+            "persistent": True,
+            "session-options": {
+                "nss": [{"name": "gtw", "uri": "http://sagemcom.com/gateway-data"}],
+                "language": "ident",
+                "context-flags": {"get-content-name": True, "local-time": True},
+                "capability-depth": 2,
+                "capability-flags": {
+                    "name": True,
+                    "default-value": False,
+                    "restriction": True,
+                    "description": False,
+                },
+                "time-format": "ISO_8601",
+                "write-only-string": "_XMO_WRITE_ONLY_",
+                "undefined-write-only-string": "_XMO_UNDEFINED_WRITE_ONLY_",
+            },
+        },
+    )
+
+
+class Actions:
+    actions: List[Action] = field(default_factory=list)
+
+    def __init__(self, *args: Action):
+        """Initialize with list of actions."""
+        self.actions = list(args)
+
+    def actions_dict(self) -> list[dict]:
+        """Return actions as dict"""
+        return [action.action_dict() for action in self.actions]
+
+
+LogoutAction = Action(id=0, method="Logout")

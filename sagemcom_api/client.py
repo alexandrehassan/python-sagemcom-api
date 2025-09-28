@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping
 import hashlib
 import json
 import math
 import random
+import urllib.parse
+from collections.abc import Iterable, Mapping
 from types import TracebackType
 from typing import Any
-import urllib.parse
 
+import backoff
+import humps
 from aiohttp import (
     ClientConnectorError,
     ClientOSError,
@@ -21,8 +23,6 @@ from aiohttp import (
     ServerDisconnectedError,
     TCPConnector,
 )
-import backoff
-import humps
 
 from .const import API_ENDPOINT, DEFAULT_TIMEOUT, DEFAULT_USER_AGENT, UINT_MAX
 from .enums import EncryptionMethod, ErrorCodes
@@ -41,7 +41,15 @@ from .exceptions import (
     UnknownPathException,
     UnsupportedHostException,
 )
-from .models import Device, DeviceInfo, PortMapping
+from .models import (
+    Action,
+    Actions,
+    Device,
+    DeviceInfo,
+    LoginAction,
+    LogoutAction,
+    PortMapping,
+)
 
 
 async def retry_login(invocation: Mapping[str, Any]) -> None:
@@ -77,12 +85,6 @@ def _handle_error(error: dict, actions: Iterable) -> None:
                 raise UnknownException(action_error)
 
 
-# def _retry_login(func):
-#     backoff.on_exception(
-#         backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
-#     )(func)
-
-
 # pylint: disable=too-many-instance-attributes
 class SagemcomClient:
     """Client to communicate with the Sagemcom API."""
@@ -114,7 +116,7 @@ class SagemcomClient:
         self.authentication_method = authentication_method
         self.password = password
         self._current_nonce = None
-        self._password_hash = self.__generate_hash(password)
+        self._password_hash = self._generate_hash(password)
         self.protocol = "https" if ssl else "http"
 
         self._server_nonce = ""
@@ -174,7 +176,7 @@ class SagemcomClient:
 
         return md5(ha1 + ":" + str(f) + ":" + str(n) + ":JSON:/cgi/json-req")
 
-    def __generate_hash(self, value, authentication_method=None):
+    def _generate_hash(self, value, authentication_method=None) -> str:
         """Hash value with selected encryption method and return HEX value."""
         auth_method = authentication_method or self.authentication_method
 
@@ -191,17 +193,17 @@ class SagemcomClient:
 
         return value
 
-    def __get_credential_hash(self):
+    def _get_credential_hash(self) -> str:
         """Build credential hash."""
-        return self.__generate_hash(
-            self.username + ":" + self._server_nonce + ":" + self._password_hash
+        return self._generate_hash(
+            f"{self.username}:{self._server_nonce}:{self._password_hash}"
         )
 
     def __generate_auth_key(self):
         """Build auth key."""
-        credential_hash = self.__get_credential_hash()
+        credential_hash = self._get_credential_hash()
         auth_string = f"{credential_hash}:{self._request_id}:{self._current_nonce}:JSON:{API_ENDPOINT}"
-        self._auth_key = self.__generate_hash(auth_string)
+        self._auth_key = self._generate_hash(auth_string)
 
     def __get_response_error(self, response: ClientResponse) -> dict | None:
         """Retrieve response error from result."""
@@ -275,7 +277,7 @@ class SagemcomClient:
 
             return result
 
-    async def __api_request_async(self, actions, priority=False):
+    async def __api_request_async(self, actions: Actions, priority=False):
         """Build request to the internal JSON-req API."""
         self.__generate_request_id()
         self.__generate_nonce()
@@ -286,7 +288,7 @@ class SagemcomClient:
                 "id": self._request_id,
                 "session-id": int(self._session_id),
                 "priority": priority,
-                "actions": actions,
+                "actions": actions.actions_dict(),
                 "cnonce": self._current_nonce,
                 "auth-key": self._auth_key,
             }
@@ -298,52 +300,25 @@ class SagemcomClient:
         except (ClientConnectorError, ClientOSError, ServerDisconnectedError) as e:
             raise ConnectionError(str(e)) from e
 
-    async def login(self):
+    async def login(self) -> None:
         """Login to the SagemCom F@st router using a username and password."""
-
-        actions = {
-            "id": 0,
-            "method": "logIn",
-            "parameters": {
-                "user": self.username,
-                "persistent": True,
-                "session-options": {
-                    "nss": [{"name": "gtw", "uri": "http://sagemcom.com/gateway-data"}],
-                    "language": "ident",
-                    "context-flags": {"get-content-name": True, "local-time": True},
-                    "capability-depth": 2,
-                    "capability-flags": {
-                        "name": True,
-                        "default-value": False,
-                        "restriction": True,
-                        "description": False,
-                    },
-                    "time-format": "ISO_8601",
-                    "write-only-string": "_XMO_WRITE_ONLY_",
-                    "undefined-write-only-string": "_XMO_UNDEFINED_WRITE_ONLY_",
-                },
-            },
-        }
-
         try:
-            response = await self.__api_request_async([actions], True)
+            response = await self.__api_request_async(
+                Actions(LoginAction(self.username)), True
+            )
         except asyncio.TimeoutError as exception:
             raise LoginTimeoutException from exception
 
         data = self.__get_response(response)
+        if data["id"] is None or data["nonce"] is None:
+            raise UnauthorizedException(data)
 
-        if data["id"] is not None and data["nonce"] is not None:
-            self._session_id = data["id"]
-            self._server_nonce = data["nonce"]
-            return True
-
-        raise UnauthorizedException(data)
+        self._session_id = data["id"]
+        self._server_nonce = data["nonce"]
 
     async def logout(self):
         """Log out of the Sagemcom F@st device."""
-        actions = {"id": 0, "method": "logOut"}
-
-        await self.__api_request_async([actions], False)
+        await self.__api_request_async(Actions(LogoutAction), False)
 
         self._session_id = -1
         self._server_nonce = ""
@@ -351,10 +326,10 @@ class SagemcomClient:
 
     async def get_encryption_method(self):
         """Determine which encryption method to use for authentication and set it directly."""
+
         for encryption_method in EncryptionMethod:
             try:
-                self.authentication_method = encryption_method
-                self._password_hash = self.__generate_hash(
+                self._password_hash = self._generate_hash(
                     self.password, encryption_method
                 )
 
@@ -363,16 +338,14 @@ class SagemcomClient:
                 self._server_nonce = ""
                 self._session_id = 0
                 self._request_id = -1
+                break
 
-                return encryption_method
-            except (
-                LoginTimeoutException,
-                AuthenticationException,
-                LoginRetryErrorException,
-            ):
+            except RetryableException:
                 pass
-
-        return None
+        else:
+            return None
+        self.authentication_method = encryption_method
+        return encryption_method
 
     @backoff.on_exception(
         backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
@@ -384,14 +357,11 @@ class SagemcomClient:
         :param xpath: path expression
         :param options: optional options
         """
-        actions = {
-            "id": 0,
-            "method": "getValue",
-            "xpath": urllib.parse.quote(xpath, "/=[]'"),
-            "options": options if options else {},
-        }
+        actions = Actions(
+            Action(0, "getValue", xpath=urllib.parse.quote(xpath), options=options)
+        )
 
-        response = await self.__api_request_async([actions], False)
+        response = await self.__api_request_async(actions, False)
         data = self.__get_response_value(response)
 
         return data
@@ -399,22 +369,19 @@ class SagemcomClient:
     @backoff.on_exception(
         backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
     )
-    async def get_values_by_xpaths(self, xpaths, options: dict | None = None) -> dict:
+    async def get_values_by_xpaths(
+        self, xpaths: dict, options: dict | None = None
+    ) -> dict:
         """
         Retrieve raw values from router using XPath.
 
         :param xpaths: Dict of key to xpath expression
         :param options: optional options
         """
-        actions = [
-            {
-                "id": i,
-                "method": "getValue",
-                "xpath": urllib.parse.quote(xpath),
-                "options": options if options else {},
-            }
+        actions = Actions(
+            Action(i, "getValue", xpath=urllib.parse.quote(xpath), options=options)
             for i, xpath in enumerate(xpaths.values())
-        ]
+        )
 
         response = await self.__api_request_async(actions, False)
         values = [self.__get_response_value(response, i) for i in range(len(xpaths))]
@@ -435,15 +402,15 @@ class SagemcomClient:
         :param value: value
         :param options: optional options
         """
-        actions = {
-            "id": 0,
-            "method": "setValue",
-            "xpath": urllib.parse.quote(xpath),
-            "parameters": {"value": str(value)},
-            "options": options if options else {},
-        }
+        action = Action(
+            0,
+            "setValue",
+            xpath=urllib.parse.quote(xpath),
+            parameters={"value": str(value)},
+            options=options,
+        )
 
-        response = await self.__api_request_async([actions], False)
+        response = await self.__api_request_async(Actions(action), False)
 
         return response
 
@@ -473,18 +440,19 @@ class SagemcomClient:
     @backoff.on_exception(
         backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
     )
-    async def get_hosts(self, only_active: bool | None = False) -> list[Device]:
+    async def get_hosts(self, only_active: bool = False) -> list[Device]:
         """Retrieve hosts connected to Sagemcom F@st device."""
+
+        def _filter(data: dict) -> bool:
+            if only_active:
+                return data.get("active", False) is True
+            return True
+
         data = await self.get_value_by_xpath(
             "Device/Hosts/Hosts", options={"capability-flags": {"interface": True}}
         )
-        devices = [Device(**d) for d in data]
 
-        if only_active:
-            active_devices = [d for d in devices if d.active is True]
-            return active_devices
-
-        return devices
+        return [Device(**d) for d in data if _filter(d)]
 
     @backoff.on_exception(
         backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
@@ -492,23 +460,21 @@ class SagemcomClient:
     async def get_port_mappings(self) -> list[PortMapping]:
         """Retrieve configured Port Mappings on Sagemcom F@st device."""
         data = await self.get_value_by_xpath("Device/NAT/PortMappings")
-        port_mappings = [PortMapping(**p) for p in data]
-
-        return port_mappings
+        return [PortMapping(**p) for p in data]
 
     @backoff.on_exception(
         backoff.expo, RetryableException, max_tries=1, on_backoff=retry_login
     )
     async def reboot(self):
         """Reboot Sagemcom F@st device."""
-        action = {
-            "id": 0,
-            "method": "reboot",
-            "xpath": "Device",
-            "parameters": {"source": "GUI"},
-        }
+        action = Action(
+            id=0,
+            method="reboot",
+            xpath="Device",
+            parameters={"source": "GUI"},
+        )
 
-        response = await self.__api_request_async([action], False)
+        response = await self.__api_request_async(Actions(action), False)
         data = self.__get_response_value(response)
 
         return data
